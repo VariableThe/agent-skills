@@ -18,6 +18,7 @@ a browser. Everything runs on-device; no file ever leaves the machine.
 |---|---|---|
 | `pdf-toolkit` | merge, split, rotate, text watermark, page numbers | `pymupdf` |
 | `pdf-convert` | images to PDF, PDF pages to PNG | `pymupdf`, `pillow` |
+| `pptx-toolkit` | merge PPTX decks, slide info, slides to PDF | stdlib; `pymupdf` for to-pdf |
 | `image-toolkit` | resize, crop, text watermark, box blur | `pillow` |
 | `image-ocr` | image to text | `tesseract` binary |
 | `image-palette` | dominant-color palette | `pillow` |
