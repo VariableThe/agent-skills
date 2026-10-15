@@ -811,30 +811,72 @@ SUB_CLOSING_DEFAULT = "Got it \u2014 wrapping up here."
 SUB_QUIET_SECS = 6.0
 SUB_UNSUB_WAIT_SECS = 5.0
 
-DEFAULT_STOP_PHRASES = (
-    "stop",
+DEFAULT_STOP_ANCHORED = (
+    "unsubscribe",
+    "unsubscribe me",
+    "unsubscribe from this",
+    "stop the bot",
+    "stop replying",
+    "stop the subscription",
+    "end the subscription",
+    "close the subscription",
+    "bot stop",
     "that's all",
     "thats all",
-    "that's it",
-    "thats it",
     "we're done",
     "were done",
     "no more",
+    "that's it",
+    "thats it",
     "thanks that's it",
+    "thanks thats it",
     "done for now",
     "wrap up",
 )
 
+DEFAULT_STOP_EXACT = (
+    "stop",
+    "cancel",
+    "quit",
+    "enough",
+    "leave it",
+    "end it",
+)
+
+# Kept for backward compatibility: the union of both default sets.
+DEFAULT_STOP_PHRASES = DEFAULT_STOP_ANCHORED + DEFAULT_STOP_EXACT
+
 _STOP_EDGE_CHARS = "\"'\u201c\u201d\u2018\u2019.,!?;:()[]{}<>\u2014\u2013-... \t\n\r"
 
 
-def parse_stop_phrases(raw):
-    """Split a --stop-phrases value (comma-separated) into a phrase list."""
+def parse_stop_phrases(raw, defaults=DEFAULT_STOP_ANCHORED):
+    """Parse a --stop-phrases value into the anchored phrase list.
+
+    The comma-separated entries are added to the built-in anchored set
+    (equality or start/end of a short message). ``None``/empty keeps the
+    defaults as-is; user entries are never dropped and defaults are
+    never lost.
+    """
     if raw is None:
-        return list(DEFAULT_STOP_PHRASES)
-    phrases = [p.strip().lower() for p in str(raw).split(",")]
-    phrases = [p for p in phrases if p]
-    return phrases or list(DEFAULT_STOP_PHRASES)
+        return list(defaults)
+    extras = [p.strip().lower() for p in str(raw).split(",")]
+    extras = [p for p in extras if p]
+    if not extras:
+        return list(defaults)
+    out = list(defaults)
+    for phrase in extras:
+        if phrase not in out:
+            out.append(phrase)
+    return out
+
+
+def parse_stop_phrases_exact(raw):
+    """Parse a --stop-phrases-exact value into the exact-only phrase list.
+
+    Entries are added to the built-in exact set (whole-message equality
+    only). ``None``/empty keeps the defaults as-is.
+    """
+    return parse_stop_phrases(raw, defaults=DEFAULT_STOP_EXACT)
 
 
 def normalize_stop_text(text):
@@ -849,27 +891,36 @@ def normalize_stop_text(text):
     return re.sub(r"\s+", " ", t).strip()
 
 
-def is_stop_message(text, phrases=None):
+def is_stop_message(text, phrases=None, exact_phrases=None):
     """True if ``text`` ends the subscription.
 
-    Match is case-insensitive and only fires on short messages (<= 8
-    words). The text must equal a stop phrase or start/end with one at a
-    word boundary, so ordinary prose merely containing those words (e.g.
-    "don't stop the deploy") does not terminate the subscriber.
+    Two sets, two rules (case-insensitive, short messages of <= 8 words
+    only). ``phrases`` (anchored set) matches when the message equals the
+    phrase or starts/ends with it at a word boundary, so "unsubscribe
+    please" stops. ``exact_phrases`` matches only when the whole message
+    equals the phrase, so bare "stop" stops but "stop the deploy" does
+    not. Ordinary prose merely containing those words (e.g. "don't stop
+    the deploy") never terminates the subscriber.
     """
-    phrases = list(DEFAULT_STOP_PHRASES) if phrases is None else list(phrases)
+    anchored = (list(DEFAULT_STOP_ANCHORED) if phrases is None
+                else list(phrases))
+    exact = (list(DEFAULT_STOP_EXACT) if exact_phrases is None
+             else list(exact_phrases))
     norm = normalize_stop_text(text)
     if not norm:
         return False
     if len(norm.split()) > 8:
         return False
-    lowered = [p.strip().lower() for p in phrases if p and p.strip()]
+    lowered = [normalize_stop_text(p) for p in anchored]
+    lowered = [p for p in lowered if p]
     for phrase in lowered:
         if norm == phrase:
             return True
         if norm.startswith(phrase + " ") or norm.endswith(" " + phrase):
             return True
-    return False
+    exact_normed = {normalize_stop_text(p) for p in exact}
+    exact_normed.discard("")
+    return norm in exact_normed
 
 
 def sub_base_dir(args):
@@ -1084,8 +1135,11 @@ def send_sub_text(host, shim, chat_id, text, timeout, local, dry_run,
     return True
 
 
-def run_subscriber(args, paths, phrases, ack_text, dry_run):
+def run_subscriber(args, paths, phrases, ack_text, dry_run,
+                   exact_phrases=None):
     """Foreground subscriber loop: poll, queue, ack bursts, stop-or-idle."""
+    exact = (list(DEFAULT_STOP_EXACT) if exact_phrases is None
+             else list(exact_phrases))
     local = getattr(args, "local_mode", False)
     log_path = paths["log"]
     stop_event = threading.Event()
@@ -1228,7 +1282,8 @@ def run_subscriber(args, paths, phrases, ack_text, dry_run):
                 last_inbound = time.monotonic()
                 last_activity = record["queuedAt"]
                 refresh_sub_state(last_activity)
-                if is_stop_message(record["text"], phrases):
+                if is_stop_message(record["text"], phrases,
+                                    exact_phrases=exact):
                     flush_ack("final burst before stop")
                     closing = SUB_CLOSING_DEFAULT
                     sub_log(log_path,
@@ -1313,10 +1368,13 @@ def cmd_subscribe(args):
     if args.idle_hours <= 0:
         fail("subscribe idle-hours must be positive")
     phrases = parse_stop_phrases(getattr(args, "stop_phrases", None))
+    exact = parse_stop_phrases_exact(
+        getattr(args, "stop_phrases_exact", None))
     ack_text = args.ack or SUB_ACK_DEFAULT
     paths = sub_paths(args, args.chat)
     if getattr(args, "foreground", False):
-        sys.exit(run_subscriber(args, paths, phrases, ack_text, dry_run))
+        sys.exit(run_subscriber(args, paths, phrases, ack_text, dry_run,
+                                exact_phrases=exact))
 
     # Detached: re-exec this script as a session leader; stdio goes to the
     # log file so the child survives the parent's exit.
@@ -1344,6 +1402,8 @@ def cmd_subscribe(args):
     ]
     if getattr(args, "stop_phrases", None):
         child_argv += ["--stop-phrases", args.stop_phrases]
+    if getattr(args, "stop_phrases_exact", None):
+        child_argv += ["--stop-phrases-exact", args.stop_phrases_exact]
     if getattr(args, "include_backlog", False):
         child_argv += ["--include-backlog"]
     parent = os.path.dirname(paths["log"])
@@ -1648,8 +1708,14 @@ def build_parser():
                        help="Exit after this many inbound-quiet hours "
                             "(default 6).")
     p_sub.add_argument("--stop-phrases", default=None,
-                       help="Comma-separated stop phrases overriding the "
-                            "built-in set.")
+                       help="Comma-separated anchored stop phrases (match on "
+                            "equality or at message start/end). Extends the "
+                            "built-in anchored set.")
+    p_sub.add_argument("--stop-phrases-exact", default=None,
+                       help="Comma-separated exact-only stop phrases (match "
+                            "only when the whole message equals them). "
+                            "Extends the built-in exact set "
+                            "(stop, cancel, quit, enough, leave it, end it).")
     p_sub.add_argument("--foreground", action="store_true",
                        help="Run the loop in this process instead of "
                             "detaching.")
