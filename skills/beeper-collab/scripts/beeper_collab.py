@@ -2,7 +2,9 @@
 """Collaborate over Beeper chats via the Beeper Desktop MCP bridge (stdlib only).
 
 Transport: spawns the MCP bridge over ssh and speaks newline-delimited
-JSON-RPC on stdin. No token, no tunnel, no port. Usage:
+JSON-RPC on stdin. No token, no tunnel, no port. On the Beeper host itself
+the shim is exec'd directly (no self-ssh): auto-detected when --host names
+this machine, or forced with --local. Usage:
 
     python3 scripts/beeper_collab.py --help
     python3 scripts/beeper_collab.py status
@@ -13,6 +15,7 @@ JSON-RPC on stdin. No token, no tunnel, no port. Usage:
 
 Configuration (flags with env fallbacks):
     --host     BEEPER_COLLAB_HOST   default: aditya@asus-zorin
+    --local    BEEPER_COLLAB_LOCAL  default: unset (auto-detect from --host)
     --shim     BEEPER_COLLAB_SHIM   default: $HOME/.local/bin/beeper-mcp-shim
     --state    BEEPER_COLLAB_STATE  default: ~/.local/state/beeper-collab/state.json
     --self-id  BEEPER_COLLAB_SELF_ID (optional senderID treated as "me")
@@ -24,6 +27,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -33,6 +37,7 @@ from datetime import datetime, timezone
 DEFAULT_HOST = "aditya@asus-zorin"
 DEFAULT_SHIM = "$HOME/.local/bin/beeper-mcp-shim"
 DEFAULT_STATE = "~/.local/state/beeper-collab/state.json"
+LOCAL_LOOPBACKS = {"localhost", "127.0.0.1", "::1"}
 PROTOCOL_VERSION = "2025-06-18"
 SEEN_CAP = 500
 FETCH_PAGES_MAX = 5
@@ -51,32 +56,91 @@ class BridgeError(Exception):
     """Raised when the ssh/MCP bridge call fails."""
 
 
+def expand_shim(shim):
+    """Expand $HOME/~ in the configured shim path locally."""
+    return os.path.expandvars(os.path.expanduser(shim))
+
+
+def local_machine_names():
+    """Lowercased names of this machine (short and FQDN forms)."""
+    names = set()
+    for raw in (socket.gethostname(), socket.getfqdn()):
+        if raw:
+            lowered = raw.strip().lower()
+            names.add(lowered)
+            names.add(lowered.split(".")[0])
+    return names
+
+
+def is_local_host(host, shim=None):
+    """True if ``host`` refers to the machine this script runs on.
+
+    Strips a leading ``user@`` and matches case-insensitively against the
+    local hostname/FQDN (both short and full forms, so a tailscale FQDN
+    still matches). ``localhost``/loopback counts as local only when the
+    shim exists locally; any other name never matches.
+    """
+    candidate = (host or "").strip().split("@")[-1].strip().lower()
+    if not candidate:
+        return False
+    if candidate in LOCAL_LOOPBACKS:
+        if shim is None:
+            return False
+        return os.path.isfile(expand_shim(shim))
+    names = local_machine_names()
+    if candidate in names:
+        return True
+    return candidate.split(".")[0] in names
+
+
+def spawn_bridge(host, shim, local):
+    """Spawn the MCP bridge child process.
+
+    Local mode execs the shim directly (no ssh). Remote mode uses the
+    historical ssh invocation, kept byte-for-byte identical.
+    """
+    stdio = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 1,
+    }
+    if local:
+        shim_path = expand_shim(shim)
+        if not os.path.isfile(shim_path):
+            raise BridgeError(f"local shim not found: {shim_path}")
+        # Mirror the remote shell's PATH prefix so the shim's shebang
+        # (e.g. node from ~/.local/bin) resolves without an ssh login env.
+        env = dict(os.environ)
+        env["PATH"] = (os.path.expanduser("~/.local/bin")
+                       + os.pathsep + env.get("PATH", ""))
+        try:
+            return subprocess.Popen([shim_path], env=env, **stdio)
+        except OSError as e:
+            raise BridgeError(f"could not spawn local shim {shim_path}: {e}")
+    remote_cmd = "PATH=$HOME/.local/bin:$PATH exec " + shim
+    try:
+        return subprocess.Popen(["ssh", host, remote_cmd], **stdio)
+    except OSError as e:
+        raise BridgeError(f"could not spawn ssh to {host}: {e}")
+
+
 def fail(message):
     """Print a one-line Error and exit non-zero."""
     print(f"Error: {message}", file=sys.stderr)
     sys.exit(1)
 
 
-def rpc(host, shim, method, params, timeout):
-    """Run one JSON-RPC method over a fresh ssh bridge connection.
+def rpc(host, shim, method, params, timeout, local=False):
+    """Run one JSON-RPC method over a fresh bridge connection.
 
     Handshake per invocation: initialize, notifications/initialized, then the
     request with id 2. Returns the raw ``result`` object. Non-JSON stdout
     lines are ignored. The child is always killed; a watchdog enforces the
     timeout so this never hangs.
     """
-    remote_cmd = "PATH=$HOME/.local/bin:$PATH exec " + shim
-    try:
-        proc = subprocess.Popen(
-            ["ssh", host, remote_cmd],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    except OSError as e:
-        raise BridgeError(f"could not spawn ssh to {host}: {e}")
+    proc = spawn_bridge(host, shim, local)
 
     def _kill():
         try:
@@ -151,9 +215,10 @@ def rpc(host, shim, method, params, timeout):
             pass
 
 
-def tool_call(host, shim, tool, args, timeout):
+def tool_call(host, shim, tool, args, timeout, local=False):
     """Call one MCP tool and return its raw ``result`` object."""
-    return rpc(host, shim, "tools/call", {"name": tool, "arguments": args}, timeout)
+    return rpc(host, shim, "tools/call", {"name": tool, "arguments": args},
+               timeout, local)
 
 
 def tool_text(result, tool):
@@ -172,9 +237,9 @@ def tool_text(result, tool):
     return "\n".join(texts)
 
 
-def tool_json(host, shim, tool, args, timeout):
+def tool_json(host, shim, tool, args, timeout, local=False):
     """Call a tool whose text payload is a JSON string; return the parsed value."""
-    text = tool_text(tool_call(host, shim, tool, args, timeout), tool)
+    text = tool_text(tool_call(host, shim, tool, args, timeout, local), tool)
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
@@ -382,7 +447,7 @@ def update_chat_state(entry, seen, messages):
         entry["cursorTs"] = newest.get("timestamp")
 
 
-def fetch_messages(host, shim, chat_id, timeout, pages=1):
+def fetch_messages(host, shim, chat_id, timeout, pages=1, local=False):
     """Fetch the newest page(s) of a chat; returns (items, has_more)."""
     items = []
     cursor = None
@@ -393,7 +458,7 @@ def fetch_messages(host, shim, chat_id, timeout, pages=1):
             args["cursor"] = cursor
             args["direction"] = "before"
         try:
-            data = tool_json(host, shim, "list_messages", args, timeout)
+            data = tool_json(host, shim, "list_messages", args, timeout, local)
         except BridgeError:
             if items:
                 break
@@ -423,22 +488,26 @@ def newest_first(items):
 
 
 def cmd_status(args):
+    local = getattr(args, "local_mode", False)
     try:
-        result = rpc(args.host, args.shim, "tools/list", {}, args.timeout)
+        result = rpc(args.host, args.shim, "tools/list", {}, args.timeout, local)
     except BridgeError as e:
         fail(f"bridge to {args.host} failed: {e}")
     tools = (result or {}).get("tools") if isinstance(result, dict) else None
     if not isinstance(tools, list):
         fail(f"bridge to {args.host} returned an unexpected tools/list shape")
-    print(f"connected to {args.host}; {len(tools)} tools available")
+    mode = " (local shim)" if local else ""
+    print(f"connected to {args.host}{mode}; {len(tools)} tools available")
 
 
 def cmd_resolve(args):
+    local = getattr(args, "local_mode", False)
     candidates = []
     try:
         text = tool_text(
             tool_call(args.host, args.shim, "search_chats",
-                      {"query": args.query, "limit": args.limit}, args.timeout),
+                      {"query": args.query, "limit": args.limit}, args.timeout,
+                      local),
             "search_chats",
         )
         candidates = parse_chat_cards(text)
@@ -449,7 +518,7 @@ def cmd_resolve(args):
         try:
             text = tool_text(
                 tool_call(args.host, args.shim, "search",
-                          {"query": args.query}, args.timeout),
+                          {"query": args.query}, args.timeout, local),
                 "search",
             )
             candidates = parse_chat_cards(text)
@@ -458,9 +527,11 @@ def cmd_resolve(args):
     print(json.dumps(candidates[: args.limit], indent=2, ensure_ascii=False))
 
 
-def collect_new_inbound(host, shim, chat_id, timeout, state, pages=1, self_id=None):
+def collect_new_inbound(host, shim, chat_id, timeout, state, pages=1,
+                        self_id=None, local=False):
     """Fetch messages and split into (new_inbound, all_inbound, seen)."""
-    items, _ = fetch_messages(host, shim, chat_id, timeout, pages=pages)
+    items, _ = fetch_messages(host, shim, chat_id, timeout, pages=pages,
+                              local=local)
     inbound = [m for m in items if is_inbound(m, self_id)]
     entry = state["chats"].get(chat_id)
     seen = set()
@@ -481,6 +552,7 @@ def collect_new_inbound(host, shim, chat_id, timeout, state, pages=1, self_id=No
 
 
 def cmd_inbox(args):
+    local = getattr(args, "local_mode", False)
     path = state_path(args)
     try:
         state = load_state(path)
@@ -489,7 +561,7 @@ def cmd_inbox(args):
     try:
         new, _inbound, _seen = collect_new_inbound(
             args.host, args.shim, args.chat, args.timeout, state,
-            pages=FETCH_PAGES_MAX, self_id=args.self_id,
+            pages=FETCH_PAGES_MAX, self_id=args.self_id, local=local,
         )
     except BridgeError as e:
         fail(str(e))
@@ -509,7 +581,7 @@ def cmd_inbox(args):
             # cursor exists for the next run.
             try:
                 items, _ = fetch_messages(args.host, args.shim, args.chat,
-                                          args.timeout, pages=1)
+                                          args.timeout, pages=1, local=local)
             except BridgeError as e:
                 fail(str(e))
             inbound = [m for m in items if is_inbound(m, args.self_id)]
@@ -526,6 +598,7 @@ def cmd_inbox(args):
 
 
 def cmd_watch(args):
+    local = getattr(args, "local_mode", False)
     stop = threading.Event()
 
     def _handle_signal(_signum, _frame):
@@ -557,7 +630,7 @@ def cmd_watch(args):
                 break
             try:
                 items, _ = fetch_messages(args.host, args.shim, args.chat,
-                                          args.timeout, pages=1)
+                                          args.timeout, pages=1, local=local)
             except BridgeError as e:
                 print(f"Error: watch poll failed: {e}", file=sys.stderr)
                 break
@@ -605,11 +678,12 @@ def cmd_watch(args):
     print(f"watch done for chat {args.chat}", file=sys.stderr)
 
 
-def chat_title(host, shim, chat_id, timeout):
+def chat_title(host, shim, chat_id, timeout, local=False):
     """Best-effort chat title via get_chat (falls back to the chat id)."""
     try:
         text = tool_text(
-            tool_call(host, shim, "get_chat", {"chatID": chat_id}, timeout),
+            tool_call(host, shim, "get_chat", {"chatID": chat_id}, timeout,
+                      local),
             "get_chat",
         )
         cards = parse_chat_cards(text)
@@ -621,6 +695,7 @@ def chat_title(host, shim, chat_id, timeout):
 
 
 def cmd_send(args):
+    local = getattr(args, "local_mode", False)
     if not args.text or not args.text.strip():
         fail("send requires non-empty --text")
     call_args = {"chatID": args.chat, "text": args.text}
@@ -634,13 +709,14 @@ def cmd_send(args):
         print("dry-run: nothing sent", file=sys.stderr)
         return
     try:
-        tool_call(args.host, args.shim, "send_message", call_args, args.timeout)
+        tool_call(args.host, args.shim, "send_message", call_args, args.timeout,
+                  local)
     except BridgeError as e:
         # Ambiguous failure: the send may have gone through. Re-read before
         # deciding anything, and never blind-retry.
         try:
             items, _ = fetch_messages(args.host, args.shim, args.chat,
-                                      args.timeout, pages=1)
+                                      args.timeout, pages=1, local=local)
         except BridgeError:
             items = []
         wanted = args.text.strip()
@@ -663,7 +739,7 @@ def cmd_send(args):
     while time.monotonic() < verify_deadline:
         try:
             items, _ = fetch_messages(args.host, args.shim, args.chat,
-                                      args.timeout, pages=1)
+                                      args.timeout, pages=1, local=local)
         except BridgeError as e:
             fail(f"send not verified (re-read failed: {e})")
         if items:
@@ -677,7 +753,7 @@ def cmd_send(args):
         # One last look for the text anywhere before declaring failure.
         try:
             items, _ = fetch_messages(args.host, args.shim, args.chat,
-                                      args.timeout, pages=1)
+                                      args.timeout, pages=1, local=local)
         except BridgeError:
             items = []
         anywhere = next(
@@ -692,7 +768,8 @@ def cmd_send(args):
 
 
 def report_sent(args, msg):
-    title = chat_title(args.host, args.shim, args.chat, args.timeout)
+    title = chat_title(args.host, args.shim, args.chat, args.timeout,
+                       getattr(args, "local_mode", False))
     print(f"Sent to {title} ({args.chat}): {args.text}")
     print(json.dumps(
         {"id": str(msg.get("id")), "timestamp": msg.get("timestamp"),
@@ -706,16 +783,26 @@ def build_parser():
         prog="beeper_collab.py",
         description=(
             "Collaborate over Beeper chats through the Beeper Desktop MCP "
-            "bridge (ssh stdio transport, no tokens). Commands: status "
+            "bridge (ssh stdio transport, or direct local shim exec on the "
+            "Beeper host itself; no tokens). Commands: status "
             "(connectivity), resolve (find a chat), inbox (peek at new "
             "inbound messages), watch (follow a chat), send (send + verify)."
         ),
     )
     ap.add_argument("--host", default=os.environ.get("BEEPER_COLLAB_HOST", DEFAULT_HOST),
-                    help="ssh host running Beeper Desktop (env BEEPER_COLLAB_HOST).")
+                    help="ssh host running Beeper Desktop (env BEEPER_COLLAB_HOST). "
+                         "When it names this machine, the shim runs locally "
+                         "without ssh (see --local).")
     ap.add_argument("--shim", default=os.environ.get("BEEPER_COLLAB_SHIM", DEFAULT_SHIM),
                     help="Remote MCP shim path, interpolated by the remote shell "
-                         "(env BEEPER_COLLAB_SHIM).")
+                         "(env BEEPER_COLLAB_SHIM). In local mode it is "
+                         "expanded by this script instead.")
+    ap.add_argument("--local", action="store_true",
+                    default=os.environ.get("BEEPER_COLLAB_LOCAL", "").strip().lower()
+                    in ("1", "true", "yes", "on"),
+                    help="Exec the shim directly instead of ssh "
+                         "(env BEEPER_COLLAB_LOCAL=1). Implied when --host "
+                         "names this machine.")
     ap.add_argument("--state", default=os.environ.get("BEEPER_COLLAB_STATE", DEFAULT_STATE),
                     help="State file for per-chat cursors/seen ids "
                          "(env BEEPER_COLLAB_STATE).")
@@ -823,6 +910,7 @@ def main():
     if timeout <= 0:
         fail("timeout must be positive")
     args.timeout = timeout
+    args.local_mode = bool(args.local) or is_local_host(args.host, args.shim)
     try:
         args.func(args)
     except BridgeError as e:
