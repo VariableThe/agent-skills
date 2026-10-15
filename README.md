@@ -25,6 +25,7 @@ a browser. Everything runs on-device; no file ever leaves the machine.
 | `data-csv` | XML / Apple plist to CSV | stdlib only |
 | `audio-transcribe` | speech to text (Whisper) | `faster-whisper` |
 | `notes-to-pdf` | normalize NotebookLM Markdown, build HTML/PDF | `pandoc` binary |
+| `beeper-collab` | keep a collaborator posted over Beeper, read replies back | stdlib only |
 
 ## Setup
 
@@ -35,6 +36,8 @@ pip install -r requirements.txt
 `tesseract` and `pandoc` are system binaries (`brew install tesseract pandoc`
 on macOS). PDF output from `notes-to-pdf` additionally needs a LaTeX engine
 (e.g. BasicTeX); without one it produces styled HTML instead and says so.
+`beeper-collab` needs an ssh-reachable host running Beeper Desktop with its
+MCP bridge (see its `SKILL.md`); no token is stored locally.
 
 ## Layout
 
