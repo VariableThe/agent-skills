@@ -89,8 +89,12 @@ error, more than one is an error listing the candidates (it never guesses —
 narrow with `--account <network>`, e.g. `signal`, `whatsapp`), exactly one
 subscribes and reports the chat/title/network it chose. Useful flags: `--interval S` (poll
 seconds, default 5), `--idle-hours N` (default 6),
-`--stop-phrases "a,b"` (default: stop, that's all, we're done, done for
-now, wrap up, … — matched case-insensitively on short messages only, so
+`--stop-phrases "a,b"` (added to the anchored set: match when the short
+message equals the phrase or starts/ends with it — e.g. unsubscribe, stop
+the bot; a contact saying "unsubscribe" ends the subscription),
+`--stop-phrases-exact "a,b"` (added to the exact-only set: the whole
+message must equal it — e.g. stop, cancel — so `stop the deploy` never
+triggers), both matched case-insensitively on short messages only, so
 ordinary prose never triggers them), `--foreground` (run in this process,
 for testing), `--dry-run` (poll/queue/log but send nothing),
 `--include-backlog` (opt into queueing/acking existing history).
