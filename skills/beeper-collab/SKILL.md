@@ -28,6 +28,12 @@ export BEEPER_COLLAB_STATE=~/.local/state/beeper-collab/state.json
 export BEEPER_COLLAB_SELF_ID=  # optional senderID treated as "me"
 ```
 
+On the Beeper host itself no ssh is needed: when `--host` names the
+machine the script runs on (hostname/FQDN match, `user@` prefix and case
+ignored; `localhost` counts when the shim exists), the shim is exec'd
+directly — `status` reports this as `(local shim)`. `--local`
+(`BEEPER_COLLAB_LOCAL=1`) forces local mode.
+
 ## Commands
 
 ```bash
