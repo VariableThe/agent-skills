@@ -778,6 +778,602 @@ def report_sent(args, msg):
     ))
 
 
+# ---------------------------------------------------------------------------
+# Passive subscription mode: ack + queue, never substantive replies.
+#
+# A subscriber lives in the background, polls one chat, and for each new
+# inbound message appends a record to a per-chat JSONL queue and sends a
+# single short acknowledgement per burst. It makes no model calls and never
+# generates substantive replies. It ends on a stop phrase from the contact,
+# on idle timeout, or on unsubscribe (SIGTERM).
+# ---------------------------------------------------------------------------
+
+SUB_ACK_DEFAULT = "Noted \u2014 I'll follow up on this properly."
+SUB_CLOSING_DEFAULT = "Got it \u2014 wrapping up here."
+SUB_QUIET_SECS = 6.0
+SUB_UNSUB_WAIT_SECS = 5.0
+
+DEFAULT_STOP_PHRASES = (
+    "stop",
+    "that's all",
+    "thats all",
+    "that's it",
+    "thats it",
+    "we're done",
+    "were done",
+    "no more",
+    "thanks that's it",
+    "done for now",
+    "wrap up",
+)
+
+_STOP_EDGE_CHARS = "\"'\u201c\u201d\u2018\u2019.,!?;:()[]{}<>\u2014\u2013-... \t\n\r"
+
+
+def parse_stop_phrases(raw):
+    """Split a --stop-phrases value (comma-separated) into a phrase list."""
+    if raw is None:
+        return list(DEFAULT_STOP_PHRASES)
+    phrases = [p.strip().lower() for p in str(raw).split(",")]
+    phrases = [p for p in phrases if p]
+    return phrases or list(DEFAULT_STOP_PHRASES)
+
+
+def normalize_stop_text(text):
+    """Lowercase, de-curly, and strip edge punctuation for stop matching."""
+    if not isinstance(text, str):
+        return ""
+    t = (text.replace("\u2019", "'").replace("\u2018", "'")
+             .replace("\u201c", '"').replace("\u201d", '"'))
+    t = html.unescape(t).lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.strip(_STOP_EDGE_CHARS)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def is_stop_message(text, phrases=None):
+    """True if ``text`` ends the subscription.
+
+    Match is case-insensitive and only fires on short messages (<= 8
+    words). The text must equal a stop phrase or start/end with one at a
+    word boundary, so ordinary prose merely containing those words (e.g.
+    "don't stop the deploy") does not terminate the subscriber.
+    """
+    phrases = list(DEFAULT_STOP_PHRASES) if phrases is None else list(phrases)
+    norm = normalize_stop_text(text)
+    if not norm:
+        return False
+    if len(norm.split()) > 8:
+        return False
+    lowered = [p.strip().lower() for p in phrases if p and p.strip()]
+    for phrase in lowered:
+        if norm == phrase:
+            return True
+        if norm.startswith(phrase + " ") or norm.endswith(" " + phrase):
+            return True
+    return False
+
+
+def sub_base_dir(args):
+    """Directory holding subs/, logs/ and queue/ (sibling of state file)."""
+    parent = os.path.dirname(os.path.expanduser(args.state))
+    return parent or "."
+
+
+def sub_safe_id(chat_id):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id))
+
+
+def sub_paths(args, chat_id):
+    """State, log, queue and drained paths for one subscribed chat."""
+    base = sub_base_dir(args)
+    safe = sub_safe_id(chat_id)
+    return {
+        "sub": os.path.join(base, "subs", safe + ".json"),
+        "log": os.path.join(base, "logs", safe + ".log"),
+        "queue": os.path.join(base, "queue", safe + ".jsonl"),
+        "drained": os.path.join(base, "queue", safe + ".drained.jsonl"),
+    }
+
+
+def sub_log(log_path, message):
+    """Append one timestamped line to the subscriber log."""
+    parent = os.path.dirname(log_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(f"{stamp} {message}\n")
+
+
+def queue_record(msg):
+    """One JSON-serializable queue record per inbound message."""
+    return {
+        "queuedAt": datetime.now(timezone.utc).isoformat(),
+        "id": str(msg.get("id")),
+        "timestamp": msg.get("timestamp"),
+        "sender": sender_of(msg),
+        "senderID": msg.get("senderID"),
+        "text": clean_text(msg.get("text")),
+    }
+
+
+def append_queue(queue_path, msg):
+    """Append one inbound message to the queue file; return the record."""
+    parent = os.path.dirname(queue_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    record = queue_record(msg)
+    with open(queue_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+def read_queue_records(queue_path):
+    """Read queued records (skipping blank/corrupt lines)."""
+    records = []
+    try:
+        with open(queue_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return records
+
+
+class AckBatcher:
+    """One ack per burst: each new message restarts a short quiet timer."""
+
+    def __init__(self, quiet_secs=SUB_QUIET_SECS):
+        self.quiet_secs = float(quiet_secs)
+        self.pending = []
+        self.deadline = None
+
+    def note(self, messages, now):
+        """Fold newly arrived messages into the current burst."""
+        messages = list(messages)
+        if not messages:
+            return
+        self.pending.extend(messages)
+        self.deadline = now + self.quiet_secs
+
+    def due(self, now):
+        """True when a burst is waiting and the quiet window has passed."""
+        return (bool(self.pending) and self.deadline is not None
+                and now >= self.deadline)
+
+    def flush(self):
+        """Take the pending burst and reset the timer."""
+        burst = self.pending
+        self.pending = []
+        self.deadline = None
+        return burst
+
+
+def pid_alive(pid):
+    """True if a process with ``pid`` exists (SIG 0 probe)."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def write_sub_state(sub_path, info):
+    parent = os.path.dirname(sub_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = sub_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, sub_path)
+
+
+def read_sub_state(sub_path):
+    with open(sub_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+def list_sub_states(args):
+    """(live, stale): parsed sub-state dicts split by process liveness."""
+    base = sub_base_dir(args)
+    subs_dir = os.path.join(base, "subs")
+    live, stale = [], []
+    try:
+        names = sorted(os.listdir(subs_dir))
+    except FileNotFoundError:
+        return live, stale
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(subs_dir, name)
+        try:
+            info = read_sub_state(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        info["_path"] = path
+        if pid_alive(info.get("pid")):
+            info["alive"] = True
+            live.append(info)
+        else:
+            info["alive"] = False
+            stale.append(info)
+    return live, stale
+
+
+def send_sub_text(host, shim, chat_id, text, timeout, local, dry_run,
+                  log_path):
+    """Send one subscriber line (ack/closing); dry-run only logs it."""
+    if dry_run:
+        sub_log(log_path, f"out (dry-run, not sent): {text}")
+        return False
+    tool_call(host, shim, "send_message",
+              {"chatID": chat_id, "text": text}, timeout, local)
+    sub_log(log_path, f"out (sent): {text}")
+    return True
+
+
+def run_subscriber(args, paths, phrases, ack_text, dry_run):
+    """Foreground subscriber loop: poll, queue, ack bursts, stop-or-idle."""
+    local = getattr(args, "local_mode", False)
+    log_path = paths["log"]
+    stop_event = threading.Event()
+
+    def _handle_signal(_signum, _frame):
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        state = load_state(state_path(args))
+    except BridgeError as e:
+        fail(str(e))
+    entry, seen = get_chat_state(state, args.chat)
+    cursor_ts = entry.get("cursorTs")
+
+    title = chat_title(args.host, args.shim, args.chat, args.timeout, local)
+    started_at = datetime.now(timezone.utc).isoformat()
+    info = {
+        "chatID": args.chat,
+        "title": title,
+        "pid": os.getpid(),
+        "startedAt": started_at,
+        "lastActivity": started_at,
+        "queuePath": paths["queue"],
+        "logPath": log_path,
+        "interval": args.interval,
+        "idleHours": args.idle_hours,
+        "dryRun": bool(dry_run),
+    }
+    write_sub_state(paths["sub"], info)
+    sub_log(log_path,
+            f"subscribed to chat {args.chat} ({title}) pid={os.getpid()} "
+            f"interval={args.interval:g}s idle_hours={args.idle_hours:g} "
+            f"dry_run={bool(dry_run)}")
+
+    batcher = AckBatcher(SUB_QUIET_SECS)
+    idle_secs = float(args.idle_hours) * 3600.0
+    last_inbound = time.monotonic()
+    signalled = False
+
+    def persist_cursor():
+        try:
+            merge_seen(entry, seen)
+            save_state(state_path(args), state)
+        except OSError:
+            pass
+
+    def refresh_sub_state(last_activity):
+        info["lastActivity"] = last_activity
+        try:
+            write_sub_state(paths["sub"], info)
+        except OSError:
+            pass
+
+    def remove_sub_state():
+        try:
+            os.remove(paths["sub"])
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def flush_ack(reason):
+        burst = batcher.flush()
+        if not burst:
+            return
+        line = f"ack ({reason}): {ack_text}"
+        sub_log(log_path, line)
+        try:
+            send_sub_text(args.host, args.shim, args.chat, ack_text,
+                          args.timeout, local, dry_run, log_path)
+        except BridgeError as e:
+            sub_log(log_path, f"ack failed ({reason}): {e}")
+
+    while not stop_event.is_set():
+        try:
+            items, _ = fetch_messages(args.host, args.shim, args.chat,
+                                      args.timeout, pages=1, local=local)
+        except BridgeError as e:
+            sub_log(log_path, f"poll failed: {e}")
+            stop_event.wait(args.interval)
+            if (not stop_event.is_set()
+                    and time.monotonic() - last_inbound >= idle_secs):
+                sub_log(log_path,
+                        f"idle timeout: no inbound for {args.idle_hours:g}h; "
+                        "exiting")
+                persist_cursor()
+                remove_sub_state()
+                return 0
+            continue
+        # Reuse the skill's inbound-filter/dedupe machinery (same as watch).
+        inbound = [m for m in items if is_inbound(m, args.self_id)]
+        fresh = sorted(
+            [m for m in inbound if is_new(m, seen, cursor_ts)],
+            key=lambda m: parse_ts(m.get("timestamp"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        now_mono = time.monotonic()
+        if fresh:
+            for msg in fresh:
+                record = append_queue(paths["queue"], msg)
+                sub_log(log_path,
+                        f"queued message id={record['id']} "
+                        f"sender={record['sender']}")
+                last_inbound = time.monotonic()
+                last_activity = record["queuedAt"]
+                refresh_sub_state(last_activity)
+                if is_stop_message(record["text"], phrases):
+                    flush_ack("final burst before stop")
+                    closing = SUB_CLOSING_DEFAULT
+                    sub_log(log_path,
+                            f"stop phrase in message id={record['id']}; "
+                            f"closing: {closing}")
+                    try:
+                        send_sub_text(args.host, args.shim, args.chat,
+                                      closing, args.timeout, local, dry_run,
+                                      log_path)
+                    except BridgeError as e:
+                        sub_log(log_path, f"closing line failed: {e}")
+                    update_chat_state(entry, seen, fresh)
+                    cursor_ts = entry.get("cursorTs")
+                    persist_cursor()
+                    remove_sub_state()
+                    return 0
+            update_chat_state(entry, seen, fresh)
+            cursor_ts = entry.get("cursorTs")
+            try:
+                save_state(state_path(args), state)
+            except OSError as e:
+                sub_log(log_path, f"could not write state file: {e}")
+            batcher.note(fresh, time.monotonic())
+        else:
+            if inbound:
+                for msg in inbound:
+                    seen.add(str(msg.get("id")))
+        now_mono = time.monotonic()
+        if batcher.due(now_mono):
+            flush_ack(f"burst of {len(batcher.pending)} message(s), "
+                      "quiet window passed")
+        if time.monotonic() - last_inbound >= idle_secs:
+            sub_log(log_path,
+                    f"idle timeout: no inbound for {args.idle_hours:g}h; "
+                    "exiting")
+            persist_cursor()
+            remove_sub_state()
+            return 0
+        stop_event.wait(args.interval)
+
+    # SIGTERM/SIGINT: flush a warranted (already queued) ack, persist, exit.
+    signalled = True
+    if signalled:
+        flush_ack("shutdown")
+        persist_cursor()
+        remove_sub_state()
+        sub_log(log_path, "unsubscribed (signal); exiting")
+    return 0
+
+
+def cmd_subscribe(args):
+    dry_run = bool(getattr(args, "subscribe_dry_run", False)
+                   or getattr(args, "dry_run", False))
+    if args.interval <= 0:
+        fail("subscribe interval must be positive")
+    if args.idle_hours <= 0:
+        fail("subscribe idle-hours must be positive")
+    phrases = parse_stop_phrases(getattr(args, "stop_phrases", None))
+    ack_text = args.ack or SUB_ACK_DEFAULT
+    paths = sub_paths(args, args.chat)
+    if getattr(args, "foreground", False):
+        sys.exit(run_subscriber(args, paths, phrases, ack_text, dry_run))
+
+    # Detached: re-exec this script as a session leader; stdio goes to the
+    # log file so the child survives the parent's exit.
+    script = os.path.abspath(__file__)
+    child_argv = [
+        sys.executable, script,
+        "--host", args.host,
+        "--shim", args.shim,
+        "--state", os.path.expanduser(args.state),
+        "--timeout", str(args.timeout),
+    ]
+    if getattr(args, "local", False):
+        child_argv.append("--local")
+    if getattr(args, "self_id", None):
+        child_argv += ["--self-id", args.self_id]
+    if dry_run:
+        child_argv.append("--dry-run")
+    child_argv += [
+        "subscribe",
+        "--chat", args.chat,
+        "--ack", ack_text,
+        "--interval", str(args.interval),
+        "--idle-hours", str(args.idle_hours),
+        "--foreground",
+    ]
+    if getattr(args, "stop_phrases", None):
+        child_argv += ["--stop-phrases", args.stop_phrases]
+    parent = os.path.dirname(paths["log"])
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(paths["log"], "a", encoding="utf-8") as log_fh:
+        try:
+            proc = subprocess.Popen(
+                child_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as e:
+            fail(f"could not start subscriber: {e}")
+    # Pre-write the state file so `subscriptions` sees it immediately; the
+    # child overwrites it with the chat title on startup.
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        write_sub_state(paths["sub"], {
+            "chatID": args.chat,
+            "title": args.chat,
+            "pid": proc.pid,
+            "startedAt": started_at,
+            "lastActivity": started_at,
+            "queuePath": paths["queue"],
+            "logPath": paths["log"],
+            "interval": args.interval,
+            "idleHours": args.idle_hours,
+            "dryRun": bool(dry_run),
+        })
+    except OSError as e:
+        fail(f"subscriber started (pid {proc.pid}) but state file failed: {e}")
+    print(f"subscribed to chat {args.chat} (pid {proc.pid})")
+    print(f"log: {paths['log']}")
+    print(f"queue: {paths['queue']}")
+
+
+def cmd_subscriptions(args):
+    live, stale = list_sub_states(args)
+    for info in stale:
+        print(json.dumps(
+            {k: info.get(k) for k in
+             ("chatID", "title", "pid", "startedAt", "lastActivity",
+              "queuePath", "logPath")} | {"alive": False},
+            ensure_ascii=False,
+        ))
+        try:
+            os.remove(info["_path"])
+        except OSError:
+            pass
+        else:
+            print(f"removed stale subscription for chat {info.get('chatID')} "
+                  f"(pid {info.get('pid')})", file=sys.stderr)
+    for info in live:
+        print(json.dumps(
+            {k: info.get(k) for k in
+             ("chatID", "title", "pid", "startedAt", "lastActivity",
+              "queuePath", "logPath")} | {"alive": True},
+            ensure_ascii=False,
+        ))
+    if not live and not stale:
+        print("no live subscriptions", file=sys.stderr)
+
+
+def cmd_unsubscribe(args):
+    live, stale = list_sub_states(args)
+    if getattr(args, "unsub_all", False):
+        targets = live + stale
+        if not targets:
+            print("nothing to stop: no subscriptions", file=sys.stderr)
+            return
+    else:
+        targets = [i for i in live + stale
+                   if str(i.get("chatID")) == str(args.chat)]
+        if not targets:
+            print(f"nothing to stop: no subscription for chat {args.chat}",
+                  file=sys.stderr)
+            return
+    for info in sorted(targets, key=lambda i: str(i.get("chatID"))):
+        chat_id = info.get("chatID")
+        pid = info.get("pid")
+        path = info["_path"]
+        if not info.get("alive", False):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            print(f"chat {chat_id}: process {pid} already dead; "
+                  f"cleaned up", file=sys.stderr)
+            continue
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError, TypeError) as e:
+            print(f"chat {chat_id}: could not signal pid {pid}: {e}",
+                  file=sys.stderr)
+            continue
+        deadline = time.monotonic() + SUB_UNSUB_WAIT_SECS
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if pid_alive(pid):
+            print(f"chat {chat_id}: pid {pid} still alive after SIGTERM; "
+                  f"state kept at {path}", file=sys.stderr)
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"chat {chat_id}: stopped pid {pid} but could not remove "
+                  f"{path}: {e}", file=sys.stderr)
+            continue
+        print(f"unsubscribed from chat {chat_id} (pid {pid} exited)")
+
+
+def cmd_queue(args):
+    paths = sub_paths(args, args.chat)
+    records = read_queue_records(paths["queue"])
+    if getattr(args, "drain", False):
+        if records:
+            parent = os.path.dirname(paths["drained"])
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(paths["drained"], "a", encoding="utf-8") as fh:
+                for record in records:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with open(paths["queue"], "w", encoding="utf-8") as fh:
+                pass
+        print(f"drained {len(records)} message(s) from chat {args.chat} "
+              f"to {paths['drained']}", file=sys.stderr)
+        return
+    try:
+        with open(paths["queue"], "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        if line.strip():
+            sys.stdout.write(line if line.endswith("\n") else line + "\n")
+    if not records:
+        print(f"queue for chat {args.chat} is empty", file=sys.stderr)
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="beeper_collab.py",
@@ -786,7 +1382,10 @@ def build_parser():
             "bridge (ssh stdio transport, or direct local shim exec on the "
             "Beeper host itself; no tokens). Commands: status "
             "(connectivity), resolve (find a chat), inbox (peek at new "
-            "inbound messages), watch (follow a chat), send (send + verify)."
+            "inbound messages), watch (follow a chat), send (send + verify), "
+            "subscribe (passive ack+queue daemon), subscriptions (list "
+            "daemons), unsubscribe (stop daemons), queue (read queued "
+            "messages)."
         ),
     )
     ap.add_argument("--host", default=os.environ.get("BEEPER_COLLAB_HOST", DEFAULT_HOST),
@@ -896,6 +1495,83 @@ def build_parser():
     p_watch.add_argument("--interval", type=float, default=3,
                          help="Seconds between polls (default 3).")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_sub = sub.add_parser(
+        "subscribe",
+        help="Passively follow a chat: ack each burst, queue every message.",
+        description=(
+            "Start a background subscriber that polls one chat, appends "
+            "each new inbound message to a per-chat JSONL queue, and sends "
+            "one short acknowledgement per burst of messages. It never "
+            "generates substantive replies. By default it detaches "
+            "(survives the parent) and returns immediately; --foreground "
+            "runs the loop in this process (testing/debugging). --dry-run "
+            "runs the full loop but sends nothing. Ends on a stop phrase, "
+            "on idle timeout, or on unsubscribe."
+        ),
+        epilog="Example: beeper_collab.py subscribe --chat 401",
+    )
+    p_sub.add_argument("--chat", required=True, help="ChatID to subscribe to.")
+    p_sub.add_argument("--ack", default=SUB_ACK_DEFAULT,
+                       help="Acknowledgement text, one per burst "
+                            f"(default: {SUB_ACK_DEFAULT!r}).")
+    p_sub.add_argument("--interval", type=float, default=5,
+                       help="Seconds between polls (default 5).")
+    p_sub.add_argument("--idle-hours", type=float, default=6,
+                       help="Exit after this many inbound-quiet hours "
+                            "(default 6).")
+    p_sub.add_argument("--stop-phrases", default=None,
+                       help="Comma-separated stop phrases overriding the "
+                            "built-in set.")
+    p_sub.add_argument("--foreground", action="store_true",
+                       help="Run the loop in this process instead of "
+                            "detaching.")
+    p_sub.add_argument("--dry-run", dest="subscribe_dry_run",
+                       action="store_true",
+                       help="Poll, queue and log normally but send nothing.")
+    p_sub.set_defaults(func=cmd_subscribe)
+
+    p_subs = sub.add_parser(
+        "subscriptions",
+        help="List live subscriber daemons.",
+        description=(
+            "Print one JSON object per line with chatID, title, pid, "
+            "startedAt, lastActivity, queuePath, logPath and alive. Dead "
+            "entries are reported with alive:false and cleaned up."
+        ),
+    )
+    p_subs.set_defaults(func=cmd_subscriptions)
+
+    p_unsub = sub.add_parser(
+        "unsubscribe",
+        help="Stop subscriber daemon(s).",
+        description=(
+            "Send SIGTERM to the subscriber for --chat (or all with --all), "
+            "wait briefly, confirm it exited, and remove its state file."
+        ),
+        epilog="Example: beeper_collab.py unsubscribe --chat 401",
+    )
+    unsub_target = p_unsub.add_mutually_exclusive_group(required=True)
+    unsub_target.add_argument("--chat", default=None,
+                              help="ChatID to unsubscribe from.")
+    unsub_target.add_argument("--all", dest="unsub_all", action="store_true",
+                              help="Stop every subscription.")
+    p_unsub.set_defaults(func=cmd_unsubscribe)
+
+    p_queue = sub.add_parser(
+        "queue",
+        help="Print queued inbound messages for a chat.",
+        description=(
+            "Print the queued messages as JSON lines (the input the agent "
+            "consumes). With --drain, move them to a .drained file instead "
+            "of deleting them."
+        ),
+        epilog="Example: beeper_collab.py queue --chat 401 --drain",
+    )
+    p_queue.add_argument("--chat", required=True, help="ChatID to read.")
+    p_queue.add_argument("--drain", action="store_true",
+                         help="Consume the queue into the .drained file.")
+    p_queue.set_defaults(func=cmd_queue)
 
     return ap
 
