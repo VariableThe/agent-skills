@@ -1033,6 +1033,45 @@ def list_sub_states(args):
     return live, stale
 
 
+def baseline_existing_history(entry, seen, inbound):
+    """Mark existing inbound messages as seen without rewinding the cursor.
+
+    Adds every inbound id to ``seen`` (never removes) and advances
+    ``cursorTs``/``cursorId`` only forward, so a concurrent advance (e.g.
+    ``inbox --advance`` or another subscriber) is never undone. Returns
+    the number of newly marked messages (0 when already current).
+    """
+    fresh_ids = [str(m.get("id")) for m in inbound
+                 if str(m.get("id")) not in seen]
+    for mid in fresh_ids:
+        seen.add(mid)
+    merge_seen(entry, seen)
+    if inbound:
+        newest = None
+        newest_dt = None
+        for msg in inbound:
+            dt = parse_ts(msg.get("timestamp"))
+            dt_cmp = (dt if dt is not None
+                      else datetime.min.replace(tzinfo=timezone.utc))
+            if newest_dt is None or dt_cmp >= newest_dt:
+                newest_dt = dt_cmp
+                newest = msg
+        cur_raw = entry.get("cursorTs")
+        cur_dt = parse_ts(cur_raw) if cur_raw is not None else None
+        if cur_dt is None:
+            if cur_raw is None and newest is not None:
+                entry["cursorId"] = str(newest.get("id"))
+                entry["cursorTs"] = newest.get("timestamp")
+            elif cur_raw is not None and newest_dt is not None:
+                # Existing cursor is unparseable; only advance, never rewind.
+                # Keep the stored value rather than guessing.
+                pass
+        elif newest_dt is not None and newest_dt >= cur_dt:
+            entry["cursorId"] = str(newest.get("id"))
+            entry["cursorTs"] = newest.get("timestamp")
+    return len(fresh_ids)
+
+
 def send_sub_text(host, shim, chat_id, text, timeout, local, dry_run,
                   log_path):
     """Send one subscriber line (ack/closing); dry-run only logs it."""
@@ -1086,6 +1125,36 @@ def run_subscriber(args, paths, phrases, ack_text, dry_run):
             f"subscribed to chat {args.chat} ({title}) pid={os.getpid()} "
             f"interval={args.interval:g}s idle_hours={args.idle_hours:g} "
             f"dry_run={bool(dry_run)}")
+
+    include_backlog = bool(getattr(args, "include_backlog", False))
+    if not include_backlog:
+        try:
+            base_items, _ = fetch_messages(args.host, args.shim, args.chat,
+                                           args.timeout, pages=FETCH_PAGES_MAX,
+                                           local=local)
+        except BridgeError as e:
+            sub_log(log_path, f"baseline skipped (poll failed: {e}); "
+                              "watching for new inbound")
+        else:
+            base_inbound = [m for m in base_items
+                            if is_inbound(m, args.self_id)]
+            # Re-read state: another process may have advanced the cursor
+            # while we were fetching; baselining must not un-see or rewind.
+            try:
+                state = load_state(state_path(args))
+            except BridgeError:
+                pass
+            else:
+                entry, seen = get_chat_state(state, args.chat)
+                count = baseline_existing_history(entry, seen, base_inbound)
+                cursor_ts = entry.get("cursorTs")
+                try:
+                    save_state(state_path(args), state)
+                except OSError as e:
+                    sub_log(log_path, f"could not write state file: {e}")
+                sub_log(log_path,
+                        f"baselined {count} existing inbound messages in "
+                        f"{title}; watching for new inbound")
 
     batcher = AckBatcher(SUB_QUIET_SECS)
     idle_secs = float(args.idle_hours) * 3600.0
@@ -1275,6 +1344,8 @@ def cmd_subscribe(args):
     ]
     if getattr(args, "stop_phrases", None):
         child_argv += ["--stop-phrases", args.stop_phrases]
+    if getattr(args, "include_backlog", False):
+        child_argv += ["--include-backlog"]
     parent = os.path.dirname(paths["log"])
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -1547,7 +1618,9 @@ def build_parser():
             "Start a background subscriber that polls one chat, appends "
             "each new inbound message to a per-chat JSONL queue, and sends "
             "one short acknowledgement per burst of messages. It never "
-            "generates substantive replies. By default it detaches "
+            "generates substantive replies. Existing history is baselined "
+            "as seen (queued/acked never) unless --include-backlog is "
+            "given. By default it detaches "
             "(survives the parent) and returns immediately; --foreground "
             "runs the loop in this process (testing/debugging). --dry-run "
             "runs the full loop but sends nothing. Ends on a stop phrase, "
@@ -1580,6 +1653,12 @@ def build_parser():
     p_sub.add_argument("--foreground", action="store_true",
                        help="Run the loop in this process instead of "
                             "detaching.")
+    p_sub.add_argument("--include-backlog", dest="include_backlog",
+                       action="store_true",
+                       help="Process and acknowledge existing history "
+                            "instead of baselining it as seen (default: "
+                            "baseline existing inbound messages and only "
+                            "queue/ack new ones).")
     p_sub.add_argument("--dry-run", dest="subscribe_dry_run",
                        action="store_true",
                        help="Poll, queue and log normally but send nothing.")

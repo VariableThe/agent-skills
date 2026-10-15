@@ -63,7 +63,10 @@ the newest message — and never blind-retries on ambiguous failure.
 Starting a subscription is the agent's job, not the user's — never tell the
 user to run `subscribe` by hand.
 
-`subscribe` starts a passive background daemon for one chat. On each new
+`subscribe` starts a passive background daemon for one chat. Existing
+history is baselined as seen on startup — queued and acked never — unless
+`--include-backlog` is given, which restores the old behaviour of
+processing and acking history. On each new
 inbound message it appends a
 `{queuedAt,id,timestamp,sender,senderID,text}` record to
 `~/.local/state/beeper-collab/queue/<chatID>.jsonl` and sends one short
@@ -89,7 +92,8 @@ seconds, default 5), `--idle-hours N` (default 6),
 `--stop-phrases "a,b"` (default: stop, that's all, we're done, done for
 now, wrap up, … — matched case-insensitively on short messages only, so
 ordinary prose never triggers them), `--foreground` (run in this process,
-for testing), `--dry-run` (poll/queue/log but send nothing).
+for testing), `--dry-run` (poll/queue/log but send nothing),
+`--include-backlog` (opt into queueing/acking existing history).
 
 Close it when the task/session is over: `unsubscribe --chat <id>` (or
 `--all`) SIGTERMs the daemon and removes its state file. Otherwise the
