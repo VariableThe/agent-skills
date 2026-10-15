@@ -44,6 +44,11 @@ python3 scripts/beeper_collab.py send --chat 401 --text "noted" --reply-to 123
 python3 scripts/beeper_collab.py inbox --chat 401
 python3 scripts/beeper_collab.py inbox --chat 401 --advance
 python3 scripts/beeper_collab.py watch --chat 401 --duration-min 5
+python3 scripts/beeper_collab.py subscribe --chat 401
+python3 scripts/beeper_collab.py subscriptions
+python3 scripts/beeper_collab.py queue --chat 401
+python3 scripts/beeper_collab.py queue --chat 401 --drain
+python3 scripts/beeper_collab.py unsubscribe --chat 401
 ```
 
 Stdout is data-only (JSON); diagnostics go to stderr. `inbox` without
@@ -51,6 +56,38 @@ Stdout is data-only (JSON); diagnostics go to stderr. `inbox` without
 the messages shown. `send --dry-run` prints the tool call instead of
 sending. `send` verifies by reading the chat back — the text must appear as
 the newest message — and never blind-retries on ambiguous failure.
+
+## Subscription mode
+
+`subscribe` starts a passive background daemon for one chat. On each new
+inbound message it appends a
+`{queuedAt,id,timestamp,sender,senderID,text}` record to
+`~/.local/state/beeper-collab/queue/<chatID>.jsonl` and sends one short
+acknowledgement per burst of messages (default `Noted — I'll follow up on
+this properly.`; override with `--ack`). It never generates substantive
+replies — no model calls, nothing that puts words in the user's mouth. The queued
+content is the input the working agent consumes; the ack just holds the
+contact over until the real answer is handled later.
+
+Read the queue with `queue --chat <id>` (prints JSON lines); `--drain`
+moves the records to `<chatID>.drained.jsonl` instead of deleting them, so
+nothing is silently lost. `subscriptions` lists live daemons (chat, PID,
+started-at, last-activity, queue path, alive); stale entries are reported
+dead and cleaned up.
+
+Start one when the user expects an ongoing back-and-forth they want queued
+while they work on something else. Useful flags: `--interval S` (poll
+seconds, default 5), `--idle-hours N` (default 6),
+`--stop-phrases "a,b"` (default: stop, that's all, we're done, done for
+now, wrap up, … — matched case-insensitively on short messages only, so
+ordinary prose never triggers them), `--foreground` (run in this process,
+for testing), `--dry-run` (poll/queue/log but send nothing).
+
+Close it when the task/session is over: `unsubscribe --chat <id>` (or
+`--all`) SIGTERMs the daemon and removes its state file. Otherwise the
+contact ends it with a stop phrase (one closing line is sent), or it idles
+out after `--idle-hours` of quiet. A subscriber left running with no task
+behind it is a loose end — don't leave those.
 
 ## The collaboration loop
 
