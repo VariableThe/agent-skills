@@ -500,31 +500,49 @@ def cmd_status(args):
     print(f"connected to {args.host}{mode}; {len(tools)} tools available")
 
 
-def cmd_resolve(args):
-    local = getattr(args, "local_mode", False)
+def resolve_candidates(host, shim, query, limit, timeout, local=False):
+    """Return chat cards matching ``query`` (search_chats, fallback search)."""
     candidates = []
     try:
         text = tool_text(
-            tool_call(args.host, args.shim, "search_chats",
-                      {"query": args.query, "limit": args.limit}, args.timeout,
-                      local),
+            tool_call(host, shim, "search_chats",
+                      {"query": query, "limit": limit}, timeout, local),
             "search_chats",
         )
         candidates = parse_chat_cards(text)
     except BridgeError as e:
-        fail(str(e))
+        raise BridgeError(str(e))
     if not candidates:
-        # Fall back to the broader search tool (chats + groups + messages).
-        try:
-            text = tool_text(
-                tool_call(args.host, args.shim, "search",
-                          {"query": args.query}, args.timeout, local),
-                "search",
-            )
-            candidates = parse_chat_cards(text)
-        except BridgeError as e:
-            fail(str(e))
-    print(json.dumps(candidates[: args.limit], indent=2, ensure_ascii=False))
+        text = tool_text(
+            tool_call(host, shim, "search",
+                      {"query": query}, timeout, local),
+            "search",
+        )
+        candidates = parse_chat_cards(text)
+    return candidates[:limit]
+
+
+def format_match_list(candidates):
+    """Short 'Title (chatID, network)' list for ambiguity errors."""
+    bits = []
+    for c in candidates:
+        title = c.get("title") or "?"
+        cid = c.get("chatID") or "?"
+        net = c.get("network") or c.get("accountID") or "?"
+        bits.append(f"{title} ({cid}, {net})")
+    return "; ".join(bits)
+
+
+def cmd_resolve(args):
+    local = getattr(args, "local_mode", False)
+    try:
+        candidates = resolve_candidates(
+            args.host, args.shim, args.query, args.limit, args.timeout,
+            local,
+        )
+    except BridgeError as e:
+        fail(str(e))
+    print(json.dumps(candidates, indent=2, ensure_ascii=False))
 
 
 def collect_new_inbound(host, shim, chat_id, timeout, state, pages=1,
@@ -1193,6 +1211,32 @@ def run_subscriber(args, paths, phrases, ack_text, dry_run):
 
 
 def cmd_subscribe(args):
+    local = getattr(args, "local_mode", False)
+    match = getattr(args, "match", None)
+    if match:
+        try:
+            candidates = resolve_candidates(
+                args.host, args.shim, match, 10, args.timeout, local,
+            )
+        except BridgeError as e:
+            fail(str(e))
+        account = (getattr(args, "account", None) or "").strip().lower()
+        if account:
+            candidates = [
+                c for c in candidates
+                if str(c.get("network") or "").lower() == account
+                or str(c.get("accountID") or "").lower() == account
+            ]
+        if not candidates:
+            fail(f'no chat matched "{match}"')
+        if len(candidates) > 1:
+            fail(f'"{match}" matches more than one chat: '
+                 f"{format_match_list(candidates)}")
+        chosen = candidates[0]
+        args.chat = chosen.get("chatID")
+        print(f'matched "{match}" to {chosen.get("title")} '
+              f'({chosen.get("chatID")}) on '
+              f'{chosen.get("network") or chosen.get("accountID")}')
     dry_run = bool(getattr(args, "subscribe_dry_run", False)
                    or getattr(args, "dry_run", False))
     if args.interval <= 0:
@@ -1509,9 +1553,19 @@ def build_parser():
             "runs the full loop but sends nothing. Ends on a stop phrase, "
             "on idle timeout, or on unsubscribe."
         ),
-        epilog="Example: beeper_collab.py subscribe --chat 401",
+        epilog='Example: beeper_collab.py subscribe --chat 401\n'
+               '         beeper_collab.py subscribe --match "hada"',
     )
-    p_sub.add_argument("--chat", required=True, help="ChatID to subscribe to.")
+    sub_target = p_sub.add_mutually_exclusive_group(required=True)
+    sub_target.add_argument("--chat", default=None,
+                            help="ChatID to subscribe to.")
+    sub_target.add_argument("--match", default=None,
+                            help="Person/title query to resolve and subscribe "
+                                 "to. Refuses when it matches zero or more "
+                                 "than one chat (never guesses).")
+    p_sub.add_argument("--account", default=None,
+                       help="Network filter narrowing --match (e.g. signal, "
+                            "whatsapp; case-insensitive).")
     p_sub.add_argument("--ack", default=SUB_ACK_DEFAULT,
                        help="Acknowledgement text, one per burst "
                             f"(default: {SUB_ACK_DEFAULT!r}).")

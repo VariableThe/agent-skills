@@ -45,6 +45,7 @@ python3 scripts/beeper_collab.py inbox --chat 401
 python3 scripts/beeper_collab.py inbox --chat 401 --advance
 python3 scripts/beeper_collab.py watch --chat 401 --duration-min 5
 python3 scripts/beeper_collab.py subscribe --chat 401
+python3 scripts/beeper_collab.py subscribe --match "hada" --account signal
 python3 scripts/beeper_collab.py subscriptions
 python3 scripts/beeper_collab.py queue --chat 401
 python3 scripts/beeper_collab.py queue --chat 401 --drain
@@ -58,6 +59,9 @@ sending. `send` verifies by reading the chat back — the text must appear as
 the newest message — and never blind-retries on ambiguous failure.
 
 ## Subscription mode
+
+Starting a subscription is the agent's job, not the user's — never tell the
+user to run `subscribe` by hand.
 
 `subscribe` starts a passive background daemon for one chat. On each new
 inbound message it appends a
@@ -76,7 +80,11 @@ started-at, last-activity, queue path, alive); stale entries are reported
 dead and cleaned up.
 
 Start one when the user expects an ongoing back-and-forth they want queued
-while they work on something else. Useful flags: `--interval S` (poll
+while they work on something else. `subscribe --match "<name>"` resolves
+and subscribes atomically using the `resolve` machinery: zero matches is an
+error, more than one is an error listing the candidates (it never guesses —
+narrow with `--account <network>`, e.g. `signal`, `whatsapp`), exactly one
+subscribes and reports the chat/title/network it chose. Useful flags: `--interval S` (poll
 seconds, default 5), `--idle-hours N` (default 6),
 `--stop-phrases "a,b"` (default: stop, that's all, we're done, done for
 now, wrap up, … — matched case-insensitively on short messages only, so
@@ -91,19 +99,39 @@ behind it is a loose end — don't leave those.
 
 ## The collaboration loop
 
+When the user asks you to work with someone / keep them posted, you own the
+subscription — the user is never asked to run `subscribe` themselves.
+
 1. **Resolve** the person with `resolve`. If more than one candidate is
-   plausible (e.g. same name on WhatsApp and Instagram), **ask the user
-   which one** — never guess.
-2. **Announce** the start: one short line saying what you're working on.
-3. **Work**, and after each *meaningful milestone* send one short update
+   plausible (e.g. same name on WhatsApp and Signal), **ask the user
+   which** — never guess.
+2. **Check what is already armed** with `subscriptions` before starting
+   anything, so the same chat is never subscribed twice.
+3. **Subscribe yourself** — run `subscribe --chat <id>` (or
+   `subscribe --match "<name>"` when the query resolves to exactly one
+   chat; it refuses rather than guesses). Add
+   `--ack "<short line in the user's voice>"` when a bespoke
+   acknowledgement suits the contact. **The agent runs this; the user is
+   never asked to run it.** It returns immediately and runs in the
+   background, so keep working.
+4. **Announce** the start: one short line saying what you're working on.
+5. **Work**, and after each *meaningful milestone* send one short update
    (not after every tool call — don't spam). Include blockers as they
    appear.
-4. **Between steps**, run `inbox` to pull their replies in. Fold genuine new
-   requirements into the task.
-5. **Acknowledge** inbound asks: if they request something, reply that it's
-   noted. **Never commit to deadlines, scope, estimates, or deliverables on
-   the user's behalf** — those need the user's decision first.
-6. **Close out** with a final update: what's done, what's left, any blocker.
+6. **Between steps**, run `queue --chat <id>` to pull the contact's
+   messages in as new input, and fold genuine new requirements into the
+   task. Use `queue --chat <id> --drain` once handled so the same message
+   is not re-read.
+7. **Never send substantive auto-replies on the user's behalf.** The
+   subscriber only acknowledges and queues; anything that needs a real
+   answer either goes through the user or is answered by the agent from
+   actual work state, within the skill's existing rules. Never commit to
+   deadlines, scope, estimates, or deliverables on the user's behalf —
+   those need the user's decision first.
+8. **Close out** with a final update, then **`unsubscribe --chat <id>`**.
+   The subscription also ends on its own: a stop phrase from the contact
+   (one closing line is sent), or the idle timeout. Check `subscriptions`
+   for stale entries and clean up.
 
 ## Rules
 
