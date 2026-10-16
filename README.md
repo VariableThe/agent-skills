@@ -26,6 +26,7 @@ a browser. Everything runs on-device; no file ever leaves the machine.
 | `audio-transcribe` | speech to text (Whisper) | `faster-whisper` |
 | `notes-to-pdf` | normalize NotebookLM Markdown, build HTML/PDF | `pandoc` binary |
 | `beeper-collab` | keep a collaborator posted over Beeper, read replies back | stdlib only |
+| `beeper-bot` | activate an auto-reply bot on one named chat for a bounded time | `node` ≥ 22.5 |
 
 ## Setup
 
@@ -37,21 +38,28 @@ pip install -r requirements.txt
 on macOS). PDF output from `notes-to-pdf` additionally needs a LaTeX engine
 (e.g. BasicTeX); without one it produces styled HTML instead and says so.
 `beeper-collab` needs an ssh-reachable host running Beeper Desktop with its
-MCP bridge (see its `SKILL.md`); no token is stored locally.
+MCP bridge (see its `SKILL.md`); no token is stored locally. `beeper-bot`
+needs the same ssh-reachable Beeper Desktop host (see its `SKILL.md`).
 
 ## Layout
 
 ```
 skills/<skill-name>/
 ├── SKILL.md        # instructions (frontmatter: name, description, ...)
-└── scripts/*.py    # the actual implementation (self-contained)
+├── scripts/        # the actual implementation (self-contained; mostly
+│                   # `*.py`, but `beeper-bot` is a Node skill: `*.mjs`)
+└── ...             # some skills carry extra subdirs (e.g. `beeper-bot`
+                    # has `profiles/` and `test/`)
 ```
 
 ## Verifying a skill
 
 ```bash
 python3 skills/<skill>/scripts/<script>.py --help
+node --test skills/beeper-bot/test/beeper-bot.test.mjs
 ```
 
 Every script is a self-contained CLI: stdlib plus the deps in
-`requirements.txt`, readable `--help`, non-zero exit on failure.
+`requirements.txt` (Python) or the documented runtime (`beeper-bot` needs
+`node` ≥ 22.5), readable `--help`, non-zero exit on failure. The
+`beeper-bot` suite runs under `node --test`.

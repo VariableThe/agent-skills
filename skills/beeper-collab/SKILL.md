@@ -155,7 +155,11 @@ subscription — the user is never asked to run `subscribe` themselves.
 
 ## Unattended mode
 
-For a background loop that watches a chat and auto-replies, see
-`beeper-notify.mjs` in `VariableThe/beeper-ecocsystem-wide`. In a work
-context auto-generated replies must stay to acknowledgements only;
-substantive answers go through the working agent.
+For a background loop that watches a chat and auto-replies, use the
+`beeper-bot` skill (`VariableThe/agent-skills`, installed as
+`~/.config/opencode/skills/beeper-bot`; engine `scripts/beeper-bot.mjs`).
+It is a separate, time-boxed tool for social and test chats only —
+activate it on one named chat for a bounded duration. In a work context
+auto-generated replies must stay to acknowledgements only; that stays
+here in beeper-collab's subscribe/queue loop, and substantive answers go
+through the working agent.
